@@ -2,6 +2,7 @@
 #define FUSE_USE_VERSION 26
 #include <fuse.h>
 #include <unistd.h>
+#include <signal.h>
 
 // Standard library
 #include <iostream>
@@ -78,10 +79,12 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
         stbuf->st_mode = S_IFREG | entry->mode();
         stbuf->st_nlink = 1;
         stbuf->st_blksize = memory::block::size;
-
         if (entry->size() > 0) {
             stbuf->st_blocks = 1 + (entry->size() - 1) / memory::block::size;
         }
+
+        //stbuf->st_blksize /= memory::block::size / 512;
+        //stbuf->st_blocks  *= memory::block::size / 512;
     } else {
         stbuf->st_mode = S_IFLNK | 0777;
         stbuf->st_nlink = 1;
@@ -101,7 +104,7 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
  * Get target of link
  */
 
-static int vram_readlink(const char* path, char* buf, size_t size) {
+static int vram_readlink(const char* path, char* buf, std::size_t size) {
     lock_guard<mutex> local_lock(fsmutex);
 
     entry::entry_ref entry;
@@ -374,7 +377,7 @@ static int vram_open(const char* path, fuse_file_info* fi) {
  * Read file
  */
 
-static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
+static int vram_read(const char* path, char* buf, std::size_t size, off_t off, fuse_file_info* fi) {
     lock_guard<mutex> local_lock(fsmutex);
 
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
@@ -385,7 +388,7 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
  * Write file
  */
 
-static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
+static int vram_write(const char* path, const char* buf, std::size_t size, off_t off, fuse_file_info* fi) {
     lock_guard<mutex> local_lock(fsmutex);
 
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
@@ -466,10 +469,14 @@ static struct vram_operations : fuse_operations {
 static int print_help() {
     std::cerr <<
         "usage: vramfs <mountdir> <size> [-d <device>] [-f]\n\n"
+        "       vramfs <size> <mountdir> [-d <device>] [-f] -o <options>\n"
+        "\n"
         "  mountdir    - directory to mount file system, must be empty\n"
-        "  size        - size of the disk in bytes\n"
+        "  size        - size of the disk in bytes (or \"none\" with -o size=<size>)\n"
         "  -d <device> - specifies identifier of device to use\n"
-        "  -f          - flag that forces mounting, with a smaller size if needed\n\n"
+        "  -f          - flag that forces mounting, with a smaller size if needed\n"
+        "  -o <options>- comma-separated options: device=<device>,force,noforce,size=<size>\n"
+        "\n"
         "The size may be followed by one of the following multiplicative suffixes: "
         "K=1024, KB=1000, M=1024*1024, MB=1000*1000, G=1024*1024*1024, GB=1000*1000*1000. "
         "It's rounded up to the nearest multiple of the block size.\n"
@@ -480,7 +487,7 @@ static int print_help() {
     if (!devices.empty()) {
         std::cerr << "device list: \n";
 
-        for (size_t i = 0; i < devices.size(); ++i) {
+        for (std::size_t i = 0; i < devices.size(); ++i) {
             std::cerr << "  " << i << ": " << devices[i] << "\n";
         }
         std::cerr << std::endl;
@@ -494,11 +501,11 @@ static int print_help() {
 
 static std::regex size_regex("^([0-9]+)([KMG]B?)?$");
 
-static size_t parse_size(const string& param) {
+static std::size_t parse_size(const string& param) {
     std::smatch groups;
     std::regex_search(param, groups, size_regex);
 
-    size_t size = std::stoul(groups[1]);
+    std::size_t size = std::stoul(groups[1]);
 
     if (groups[2] == "K") size *= 1024UL;
     else if (groups[2] == "KB") size *= 1000UL;
@@ -511,23 +518,72 @@ static size_t parse_size(const string& param) {
 }
 
 int main(int argc, char* argv[]) {
+    bool force_allocate = false;
+    bool allow_exec = false, allow_suid = false, allow_dev = false;
+    int  uid = 0;
+
     // Check parameter and parse parameters
-    if (argc < 3 || argc > 6) return print_help();
-    if (!std::regex_match(argv[2], size_regex)) return print_help();
-    if (argc == 4 && strcmp(argv[3], "-f") != 0) return print_help();
-    if (argc == 5 && strcmp(argv[3], "-d") != 0) return print_help();
-    if (argc == 6) {
-        if (strcmp(argv[3], "-d") != 0 && strcmp(argv[5], "-f") != 0) {
-            return print_help();
+    if (argc < 3) return print_help();
+    std::string mount_point = argv[1], size_param = argv[2];
+    bool opts_found = false;
+    for(int n=3; n<argc; ++n)
+    {
+        if(strcmp(argv[n], "-f") == 0)
+            force_allocate = true;
+        else if(strcmp(argv[n], "-d") == 0)
+        {
+            if(n+1 == argc) return print_help();
+            memory::set_device(std::atoi(argv[++n]));
         }
+        else if(strcmp(argv[n], "-o") == 0)
+        {
+            if(n+1 == argc) return print_help();
+            std::string opts = argv[++n]; opts += ',';
+            std::smatch res;
+            std::regex pat("([^,]*),");
+            if(!opts_found) { std::swap(size_param, mount_point); argv[1] = argv[2]; }
+            opts_found = true;
+            for(auto b = opts.cbegin(); std::regex_search(b, opts.cend(), res, pat); b = res[0].second)
+            {
+                std::string token = res[1];
+                if(token == "noforce")    { force_allocate = false; }
+                else if(token == "force") { force_allocate = true; }
+                else if(std::regex_match(token, std::regex("device=[0-9]+")))
+                    { memory::set_device(std::atoi(token.c_str()+7)); }
+                else if(std::regex_match(token, std::regex("uid=[0-9]+")))
+                    { uid = std::atoi(token.c_str()+4); }
+                else if(std::regex_match(token, std::regex("size=[0-9]+(?:[KMG]B?)?")))
+                    { size_param = token.substr(5); }
+                // Parse options that may be inserted by mount(2)
+                else if(token == "rw")     { }
+                else if(token == "exec")   { allow_exec = true; }
+                else if(token == "noexec") { allow_exec = false; }
+                else if(token == "suid")   { allow_suid = true; }
+                else if(token == "nosuid") { allow_suid = false; }
+                else if(token == "dev")    { allow_dev = true; }
+                else if(token == "nodev")  { allow_dev = false; }
+                else if(token == "user")   { uid = getuid(); }
+                // Anything else is invalid
+                else { std::cerr << "Invalid option <" << token << ">\n"; return print_help(); }
+            }
+        }
+        else
+            { std::cerr << "Invalid param <" << argv[n] << ">\n"; return print_help(); }
     }
 
-    size_t disk_size = parse_size(argv[2]);
-    bool force_allocate = (argc == 4 || argc == 6);
-
-    if (argc == 5 || argc == 6) {
-        memory::set_device(atoi(argv[4]));
+    if (!std::regex_match(size_param, size_regex))
+    {
+        std::cerr << "Invalid size <" << size_param << ">\n";
+        return print_help();
     }
+    std::size_t disk_size    = parse_size(size_param);
+
+    allow_exec = allow_exec;
+    allow_suid = allow_suid;
+    allow_dev  = allow_dev;
+    uid = uid;
+
+    setsid();
 
     // Check for OpenCL supported GPU and allocate memory
     if (!memory::is_available()) {
@@ -536,7 +592,7 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "allocating vram..." << std::endl;
 
-        size_t actual_size = memory::increase_pool(disk_size);
+        std::size_t actual_size = memory::increase_pool(disk_size);
 
         if (actual_size < disk_size) {
             if (force_allocate) {
@@ -562,6 +618,29 @@ int main(int argc, char* argv[]) {
 
     // Let FUSE and the kernel deal with permissions handling
     fuse_opt_add_arg(&args, "-odefault_permissions");
+
+    /* None of this seems to work
+    if(uid)
+    {
+        static char uidbuf[64];
+        std::sprintf(uidbuf, "-ouser_id=%d", uid);
+        fuse_opt_add_arg(&args, uidbuf);
+        fuse_opt_add_arg(&args, "-oallow_root");
+    }
+    if(!uid)
+    {
+        fuse_opt_add_arg(&args, "-oallow_other");
+    }
+    */
+
+    if(opts_found)
+    {
+        chdir("/");
+        if(daemon(0,0)) { if(fork()) return 0;  dup2(dup2(open("/dev/null", O_WRONLY), 1), 2); }
+        // don't close stdout&stderr, just redirect them to /dev/null
+        // ignore some signals
+        signal(SIGPIPE, SIG_IGN);
+    }
 
     // OpenCL driver acts funky if program doesn't keep running in foreground
     fuse_opt_add_arg(&args, "-f");

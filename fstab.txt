@@ -1,0 +1,7 @@
+# Execute
+#     ln <installation_path>/vramfs -s /sbin/mount.vramfs
+#
+# to utilize these. Adapt according to your needs.
+
+1024M /mnt/vramfs1 vramfs defaults,device=1,noauto             0 0
+none  /mnt/vramfs2 vramfs defaults,device=0,noauto,size=3072M  0 0
